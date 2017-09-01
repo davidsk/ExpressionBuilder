@@ -52,16 +52,30 @@ namespace ExpressionBuilder.Builders
             var param = Expression.Parameter(typeof(T), "x");
             Expression expression = null;
             var connector = FilterStatementConnector.And;
-            foreach (var statement in filter.Statements)
+
+            // group statements by their property name / base property name
+            var statementGroups = filter.Statements.GroupBy(statement => (IsList(statement), GetBasePropertyName(statement)));
+
+            foreach (var statementGroup in statementGroups)
             {
                 Expression expr = null;
-                if (IsList(statement))
-                    expr = ProcessListStatement(param, statement);
+                if (statementGroup.Key.Item1)
+                {
+                    expr = ProcessListStatement(param, statementGroup.Key.Item2, statementGroup);
+                }
                 else
-                    expr = GetExpression(param, statement);
+                {
+                    foreach (var statement in statementGroup)
+                    {
+                        expr = GetExpression(param, statement);
+
+                        expression = expression == null ? expr : CombineExpressions(expression, expr, connector);
+                        connector = statement.Connector;
+                    }
+                }
 
                 expression = expression == null ? expr : CombineExpressions(expression, expr, connector);
-                connector = statement.Connector;
+                connector = statementGroup.LastOrDefault().Connector;
             }
 
             expression = expression ?? Expression.Constant(true);
@@ -74,19 +88,38 @@ namespace ExpressionBuilder.Builders
             return statement.PropertyId.Contains("[") && statement.PropertyId.Contains("]");
         }
 
+        private string GetBasePropertyName(IFilterStatement statement)
+        {
+            if (IsList(statement))
+            {
+                return statement.PropertyId.Substring(0, statement.PropertyId.IndexOf("["));
+            }
+
+            return statement.PropertyId;
+        }
+
         private Expression CombineExpressions(Expression expr1, Expression expr2, FilterStatementConnector connector)
         {
             return connector == FilterStatementConnector.And ? Expression.AndAlso(expr1, expr2) : Expression.OrElse(expr1, expr2);
         }
 
-        private Expression ProcessListStatement(ParameterExpression param, IFilterStatement statement)
+        private Expression ProcessListStatement(ParameterExpression param, string basePropertyName, IEnumerable<IFilterStatement> statements)
         {
-            var basePropertyName = statement.PropertyId.Substring(0, statement.PropertyId.IndexOf("["));
-            var propertyName = statement.PropertyId.Replace(basePropertyName, "").Replace("[", "").Replace("]", "");
-
             var type = param.Type.GetProperty(basePropertyName).PropertyType.GetGenericArguments()[0];
             ParameterExpression listItemParam = Expression.Parameter(type, "i");
-            var lambda = Expression.Lambda(GetExpression(listItemParam, statement, propertyName), listItemParam);
+
+            Expression expression = null;
+            var connector = FilterStatementConnector.And;
+            foreach (var statement in statements)
+            {
+                var propertyName = statement.PropertyId.Replace(basePropertyName, "").Replace("[", "").Replace("]", "");
+                var exp = GetExpression(listItemParam, statement, propertyName);
+                expression = expression == null ? exp : CombineExpressions(expression, exp, connector);
+                connector = statement.Connector;
+            }
+
+            var lambda = Expression.Lambda(expression, listItemParam);
+
             var member = helper.GetMemberExpression(param, basePropertyName);
             var enumerableType = typeof(Enumerable);
             var anyInfo = enumerableType.GetMethods(BindingFlags.Static | BindingFlags.Public).First(m => m.Name == "Any" && m.GetParameters().Count() == 2);
