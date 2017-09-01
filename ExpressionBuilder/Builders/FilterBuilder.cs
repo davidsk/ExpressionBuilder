@@ -7,6 +7,7 @@ using System.Reflection;
 using ExpressionBuilder.Common;
 using ExpressionBuilder.Interfaces;
 using ExpressionBuilder.Helpers;
+using ExpressionBuilder.Generics;
 
 namespace ExpressionBuilder.Builders
 {
@@ -49,26 +50,96 @@ namespace ExpressionBuilder.Builders
 		
 		public Expression<Func<T, bool>> GetExpression<T>(IFilter filter) where T : class
         {
+            var groupIndices = filter.GroupIndices.ToList();
+
+            // remove redundant brackets
+            groupIndices.ForEach(gi =>
+            {
+                if (gi[0] == gi[1])
+                {
+                    groupIndices.Remove(gi);
+                }
+            });
+
             var param = Expression.Parameter(typeof(T), "x");
             Expression expression = null;
             var connector = FilterStatementConnector.And;
+
+            var statementExpressions = new List<(Expression expression, FilterStatementConnector connector)>();
+
             foreach (var statement in filter.Statements)
             {
-                Expression expr = null;
-                if (IsList(statement))
-                    expr = ProcessListStatement(param, statement);
-                else
-                    expr = GetExpression(param, statement);
+                var isList = IsList(statement);
 
-                expression = expression == null ? expr : CombineExpressions(expression, expr, connector);
-                connector = statement.Connector;
+                Expression expr = null;
+                if (isList)
+                {
+                    expr = ProcessListStatement(param, statement);
+                }
+                else
+                {
+                    expr = GetExpression(param, statement);
+                }
+
+                statementExpressions.Add((expr, statement.Connector));
+            }
+
+            // resolve all grouped expressions
+            while (groupIndices.Any())
+            {
+                // find all open bracket indices    
+                var openIndices = groupIndices.Select(gi => gi[0]);
+
+                // find the innermost expressions
+                var groupExpressionIndices = groupIndices.Where(gi => !Enumerable.Range(gi[0] + 1, gi[1]).Intersect(openIndices).Any()).FirstOrDefault();
+
+                // remove from list
+                groupIndices.Remove(groupExpressionIndices);
+
+                for (var statementExpressionIndex = groupExpressionIndices[0]; statementExpressionIndex <= groupExpressionIndices[1]; statementExpressionIndex++)
+                {
+                    var statementExpression = statementExpressions[statementExpressionIndex];
+
+                    expression = expression == null ? statementExpression.expression : CombineExpressions(expression, statementExpression.expression, connector);
+                    connector = statementExpression.connector;
+
+                    statementExpressionIndex++;
+                }
+
+                // remove statement
+                for (var statementExpressionIndex = groupExpressionIndices[1]; statementExpressionIndex >= groupExpressionIndices[0]; statementExpressionIndex--)
+                {
+                    statementExpressions.RemoveAt(statementExpressionIndex);
+                }
+
+                // replace first group expression with combined expression
+                statementExpressions.Insert(groupExpressionIndices[0], (expression, connector));
+
+                // adjust indices in remaining groups
+                groupIndices.ForEach(gi =>
+                {
+                    if (gi[0] > groupExpressionIndices[0]) {
+                        gi[0] = gi[0] - (groupExpressionIndices[1] - groupExpressionIndices[0]);
+                    }
+
+                    if (gi[1] > groupExpressionIndices[0])
+                    {
+                        gi[0] = gi[0] - (groupExpressionIndices[1] - groupExpressionIndices[0]);
+                    }
+                });
+            }
+
+            foreach (var statementExpression in statementExpressions)
+            {
+                expression = expression == null ? statementExpression.expression : CombineExpressions(expression, statementExpression.expression, connector);
+                connector = statementExpression.connector;
             }
 
             expression = expression ?? Expression.Constant(true);
 
             return Expression.Lambda<Func<T, bool>>(expression, param);
         }
-		
+
         private bool IsList(IFilterStatement statement)
         {
             return statement.PropertyId.Contains("[") && statement.PropertyId.Contains("]");
@@ -86,7 +157,11 @@ namespace ExpressionBuilder.Builders
 
             var type = param.Type.GetProperty(basePropertyName).PropertyType.GetGenericArguments()[0];
             ParameterExpression listItemParam = Expression.Parameter(type, "i");
-            var lambda = Expression.Lambda(GetExpression(listItemParam, statement, propertyName), listItemParam);
+
+            var exp = GetExpression(listItemParam, statement, propertyName);
+
+            var lambda = Expression.Lambda(exp, listItemParam);
+
             var member = helper.GetMemberExpression(param, basePropertyName);
             var enumerableType = typeof(Enumerable);
             var anyInfo = enumerableType.GetMethods(BindingFlags.Static | BindingFlags.Public).First(m => m.Name == "Any" && m.GetParameters().Count() == 2);
@@ -97,6 +172,7 @@ namespace ExpressionBuilder.Builders
         private Expression GetExpression(ParameterExpression param, IFilterStatement statement, string propertyName = null)
         {
             Expression resultExpr = null;
+
             var memberName = propertyName ?? statement.PropertyId;
             Expression member = helper.GetMemberExpression(param, memberName);
             Expression constant = GetConstantExpression(member, statement.Value);

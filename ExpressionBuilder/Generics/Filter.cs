@@ -7,6 +7,7 @@ using System.Xml.Serialization;
 using System.Xml;
 using System.Xml.Schema;
 using ExpressionBuilder.Helpers;
+using System.Linq;
 
 namespace ExpressionBuilder.Generics
 {
@@ -18,6 +19,7 @@ namespace ExpressionBuilder.Generics
     public class Filter<TClass> : IFilter, IXmlSerializable where TClass : class
 	{
 		private List<IFilterStatement> _statements;
+        private List<int[]> _groupIndices;
         
         /// <summary>
         /// List of <see cref="IFilterStatement" /> that will be combined and built into a LINQ expression.
@@ -29,14 +31,44 @@ namespace ExpressionBuilder.Generics
 				return _statements.ToArray();
 			}
 		}
-		
+
+        /// <summary>
+        /// List of <see cref="IFilterStatement" /> that will be combined and built into a LINQ expression.
+        /// </summary>
+        public IEnumerable<int[]> GroupIndices
+        {
+            get
+            {
+                return _groupIndices.ToArray();
+            }
+        }
+
         /// <summary>
         /// Instantiates a new <see cref="Filter{TClass}" />
         /// </summary>
-		public Filter()
+        public Filter()
 		{
 			_statements = new List<IFilterStatement>();
+            _groupIndices = new List<int[]>();
 		}
+
+        /// <summary>
+        /// Adds a new entry to the _groupIndices list and captures the next statement index
+        /// </summary>
+        /// <returns></returns>
+        public void OpenBracket()
+        {
+            _groupIndices.Insert(0, new int[2] { this._statements.Count, 0 });
+        }
+
+        /// <summary>
+        /// Adds a new entry to the _groupIndices list and captures the next statement index
+        /// </summary>
+        /// <returns></returns>
+        public void CloseBracket()
+        {
+            _groupIndices.First(gi => gi[1] == 0)[1] = this._statements.Count - 1;
+        }
 
         /// <summary>
         /// Adds a new <see cref="FilterStatement{TPropertyType}" /> to the <see cref="Filter{TClass}" />.
