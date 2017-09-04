@@ -7,6 +7,7 @@ using System.Reflection;
 using ExpressionBuilder.Common;
 using ExpressionBuilder.Interfaces;
 using ExpressionBuilder.Helpers;
+using ExpressionBuilder.Generics;
 
 namespace ExpressionBuilder.Builders
 {
@@ -46,43 +47,135 @@ namespace ExpressionBuilder.Builders
                 { Operation.DoesNotContain, (member, constant, constant2) => Expression.Not(Contains(member, constant)) }
             };
         }
-		
-		public Expression<Func<T, bool>> GetExpression<T>(IFilter filter) where T : class
+
+        public Expression<Func<T, bool>> GetExpression<T>(IFilter filter) where T : class
         {
+            var expressionIndices = new List<int>();
+
+            var groupIndices = filter.GroupIndices.Select(gi => new StatementGroupKey() {
+                StartIndex = gi[0],
+                EndIndex = gi[1]
+            }).ToList();
+
+            // remove redundant brackets
+            groupIndices.ForEach(gi =>
+            {
+                if (gi.StartIndex == gi.EndIndex)
+                {
+                    groupIndices.Remove(gi);
+                }
+            });
+
+            var ungroupedIndices = Enumerable.Range(0, filter.Statements.Count()).Except(groupIndices.SelectMany(gi => Enumerable.Range(gi.StartIndex, (gi.EndIndex - gi.StartIndex) + 1))).ToList();
+
             var param = Expression.Parameter(typeof(T), "x");
-            Expression expression = null;
             var connector = FilterStatementConnector.And;
 
-            // group statements by their property name / base property name
-            var statementGroups = filter.Statements.GroupBy(statement => (IsList(statement), GetBasePropertyName(statement)));
+            var statements = filter.Statements.ToList();
 
-            foreach (var statementGroup in statementGroups)
+            var statementGroups = statements.ToLookup(s => groupIndices.Where(g => {
+                return g.StartIndex <= statements.IndexOf(s) && g.EndIndex >= statements.IndexOf(s);
+                }).LastOrDefault()
+            );
+
+            var sortedExpressionList = new SortedList<int, (Expression expression, FilterStatementConnector connector)>();
+            
+            // resolve all grouped expressions
+            while (groupIndices.Any())
             {
-                Expression expr = null;
-                if (statementGroup.Key.Item1)
+                // find all open bracket indices    
+                var openIndices = groupIndices.Select(gi => gi.StartIndex);
+
+                // find the innermost expressions
+                var groupStatementIndices = groupIndices.Where(gi => !Enumerable.Range(gi.StartIndex + 1, (gi.EndIndex-gi.StartIndex) + 1).Intersect(openIndices).Any()).FirstOrDefault();
+
+                // remove from list
+                groupIndices.Remove(groupStatementIndices);
+
+                var statementList = statementGroups[groupStatementIndices];
+
+                if(statementList != null && statementList.Any())
                 {
-                    expr = ProcessListStatement(param, statementGroup.Key.Item2, statementGroup);
+                    Expression expression = null;
+
+                    if (IsList(statementList.FirstOrDefault()))
+                    {
+                        var basePropertyName = GetBasePropertyName(statementList.FirstOrDefault());
+
+                        expression = ProcessListStatement(param, basePropertyName, statementList);
+
+                        connector = statementList.LastOrDefault().Connector;
+                    }
+                    else
+                    {
+                        var statementIndex = groupStatementIndices.StartIndex;
+
+                        foreach (var statement in (statementList as IEnumerable<IFilterStatement>))
+                        {
+                            var expr = sortedExpressionList.ContainsKey(statementIndex) ? sortedExpressionList[statementIndex].expression : GetExpression(param, statement);
+
+                            expression = expression == null ? expr : CombineExpressions(expression, expr, connector);
+                            connector = statement.Connector;
+
+                            statementIndex++;
+                        }
+                    }
+
+                    //expressionIndices.AddRange(Enumerable.Range(groupStatementIndices.StartIndex, (groupStatementIndices.EndIndex - groupStatementIndices.StartIndex) + 1));
+
+                    // add expression to cache
+                    if (sortedExpressionList.ContainsKey(groupStatementIndices.StartIndex))
+                    {
+                        sortedExpressionList[groupStatementIndices.StartIndex] = (expression, connector);
+                    }
+                    else
+                    {
+                        sortedExpressionList.Add(groupStatementIndices.StartIndex, (expression, connector));
+                    }
+                }
+            }
+
+            foreach (var ungroupedStatementIndex in ungroupedIndices.ToList())
+            {
+                var statement = statements[ungroupedStatementIndex];
+
+                Expression expression = null;
+
+                if (IsList(statement))
+                {
+                    var basePropertyName = GetBasePropertyName(statement);
+
+                    expression = ProcessListStatement(param, basePropertyName, statement);
                 }
                 else
                 {
-                    foreach (var statement in statementGroup)
-                    {
-                        expr = GetExpression(param, statement);
-
-                        expression = expression == null ? expr : CombineExpressions(expression, expr, connector);
-                        connector = statement.Connector;
-                    }
+                    expression = GetExpression(param, statement);
                 }
 
-                expression = expression == null ? expr : CombineExpressions(expression, expr, connector);
-                connector = statementGroup.LastOrDefault().Connector;
+                // add expression to cache
+                if (sortedExpressionList.ContainsKey(ungroupedStatementIndex))
+                {
+                    sortedExpressionList[ungroupedStatementIndex] = (expression, statement.Connector);
+                }
+                else
+                {
+                    sortedExpressionList.Add(ungroupedStatementIndex, (expression, statement.Connector));
+                }
             }
 
-            expression = expression ?? Expression.Constant(true);
+            Expression masterExpression = null;
+            foreach (var expressionItem in sortedExpressionList.Values)
+            {
+                
+                masterExpression = masterExpression == null ? expressionItem.expression : CombineExpressions(masterExpression, expressionItem.expression, connector);
+                connector = expressionItem.connector;    
+            }
 
-            return Expression.Lambda<Func<T, bool>>(expression, param);
+            masterExpression = masterExpression ?? Expression.Constant(true);
+
+            return Expression.Lambda<Func<T, bool>>(masterExpression, param);
         }
-		
+
         private bool IsList(IFilterStatement statement)
         {
             return statement.PropertyId.Contains("[") && statement.PropertyId.Contains("]");
@@ -101,6 +194,14 @@ namespace ExpressionBuilder.Builders
         private Expression CombineExpressions(Expression expr1, Expression expr2, FilterStatementConnector connector)
         {
             return connector == FilterStatementConnector.And ? Expression.AndAlso(expr1, expr2) : Expression.OrElse(expr1, expr2);
+        }
+
+        private Expression ProcessListStatement(ParameterExpression param, string basePropertyName, IFilterStatement statement)
+        {
+            var statementList = new List<IFilterStatement>();
+            statementList.Add(statement);
+
+            return ProcessListStatement(param, basePropertyName, statementList);
         }
 
         private Expression ProcessListStatement(ParameterExpression param, string basePropertyName, IEnumerable<IFilterStatement> statements)
@@ -130,6 +231,7 @@ namespace ExpressionBuilder.Builders
         private Expression GetExpression(ParameterExpression param, IFilterStatement statement, string propertyName = null)
         {
             Expression resultExpr = null;
+
             var memberName = propertyName ?? statement.PropertyId;
             Expression member = helper.GetMemberExpression(param, memberName);
             Expression constant = GetConstantExpression(member, statement.Value);
@@ -260,5 +362,11 @@ namespace ExpressionBuilder.Builders
                                     Expression.NotEqual(trimMemberCall, exprEmpty));
         }
         #endregion
+    }
+
+    internal class StatementGroupKey
+    {
+        public int StartIndex { get; set; }
+        public int EndIndex { get; set; }
     }
 }

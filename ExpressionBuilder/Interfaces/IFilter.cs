@@ -13,6 +13,10 @@ namespace ExpressionBuilder.Interfaces
 		/// </summary>
 		IEnumerable<IFilterStatement> Statements { get; }
         /// <summary>
+        /// Group of index pairs that group the statements.
+        /// </summary>
+        IEnumerable<int[]> GroupIndices { get; }
+        /// <summary>
         /// Add a statement, that doesn't need value, to this filter.
         /// </summary>
         /// <param name="propertyId">Property identifier conventionalized by for the Expression Builder.</param>
